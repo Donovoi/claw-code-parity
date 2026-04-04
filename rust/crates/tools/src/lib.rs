@@ -4,9 +4,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    default_model_for_available_credentials, max_tokens_for_model, resolve_model_alias,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -2860,7 +2861,6 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
     Err(format!("unknown skill: {requested}"))
 }
 
-const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
 const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
@@ -2996,7 +2996,7 @@ fn build_agent_runtime(
         .manifest
         .model
         .clone()
-        .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
+        .unwrap_or_else(|| default_model_for_available_credentials().to_string());
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
     let permission_policy = agent_permission_policy();
@@ -3027,11 +3027,11 @@ fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String>
 }
 
 fn resolve_agent_model(model: Option<&str>) -> String {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or(DEFAULT_AGENT_MODEL)
-        .to_string()
+    if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) {
+        model.to_string()
+    } else {
+        default_model_for_available_credentials().to_string()
+    }
 }
 
 fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
