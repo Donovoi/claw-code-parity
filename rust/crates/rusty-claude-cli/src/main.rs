@@ -22,6 +22,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
+use time::OffsetDateTime;
 
 use api::{
     AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock, InputMessage,
@@ -54,13 +55,9 @@ use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
+    api::max_tokens_for_model(model)
 }
-const DEFAULT_DATE: &str = "2026-03-31";
+const DEFAULT_BUILD_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
@@ -102,6 +99,16 @@ Run `claw --help` for usage."
         }
         std::process::exit(1);
     }
+}
+
+fn current_date_string() -> String {
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    )
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -663,7 +670,7 @@ fn filter_tool_specs(
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
     let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
-    let mut date = DEFAULT_DATE.to_string();
+    let mut date = current_date_string();
     let mut index = 0;
 
     while index < args.len() {
@@ -3140,7 +3147,8 @@ fn status_context(
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     let runtime_config = loader.load()?;
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let current_date = current_date_string();
+    let project_context = ProjectContext::discover_with_git(&cwd, &current_date)?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
@@ -3387,7 +3395,8 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let current_date = current_date_string();
+    let project_context = ProjectContext::discover(&cwd, &current_date)?;
     let mut lines = vec![format!(
         "Memory
   Working directory {}
@@ -3746,7 +3755,7 @@ fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_BUILD_DATE}"
     )
 }
 
@@ -3838,9 +3847,10 @@ fn resolve_export_path(
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let current_date = current_date_string();
     Ok(load_system_prompt(
         env::current_dir()?,
-        DEFAULT_DATE,
+        &current_date,
         env::consts::OS,
         "unknown",
     )?)

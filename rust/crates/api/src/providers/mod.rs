@@ -41,6 +41,9 @@ pub struct ProviderMetadata {
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-6";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5";
 pub const DEFAULT_XAI_MODEL: &str = "grok-3";
+const DEFAULT_KNOWN_MODEL_MAX_TOKENS: u32 = 64_000;
+const DEFAULT_UNKNOWN_MODEL_MAX_TOKENS: u32 = 1_024;
+const DEFAULT_OPUS_MAX_TOKENS: u32 = 32_000;
 
 const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
     (
@@ -303,10 +306,14 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 pub fn max_tokens_for_model(model: &str) -> u32 {
     let canonical = resolve_model_alias(model);
     if canonical.contains("opus") {
-        32_000
-    } else {
-        64_000
+        return DEFAULT_OPUS_MAX_TOKENS;
     }
+
+    if metadata_for_model(&canonical).is_some() {
+        return DEFAULT_KNOWN_MODEL_MAX_TOKENS;
+    }
+
+    DEFAULT_UNKNOWN_MODEL_MAX_TOKENS
 }
 
 #[cfg(test)]
@@ -344,6 +351,13 @@ mod tests {
     fn keeps_existing_max_token_heuristic() {
         assert_eq!(max_tokens_for_model("opus"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
+        assert_eq!(max_tokens_for_model("gpt-5"), 64_000);
+    }
+
+    #[test]
+    fn uses_conservative_cap_for_unknown_models() {
+        assert_eq!(max_tokens_for_model("Qwen/Qwen3-0.6B"), 1_024);
+        assert_eq!(max_tokens_for_model("local-llama"), 1_024);
     }
 
     #[test]
