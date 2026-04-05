@@ -1,0 +1,285 @@
+name: Upstream Sync
+
+# Scheduled runs only fire after this workflow is merged into the fork's default branch.
+# To auto-assign conflict issues to Copilot, add a COPILOT_ASSIGN_TOKEN repository secret
+# that contains a user PAT with the permissions required by GitHub's coding agent API.
+
+"on":
+    schedule:
+        - cron: "17 */6 * * *"
+    workflow_dispatch:
+        inputs:
+            target_branch:
+                description: Branch in this fork that should receive automated upstream sync PRs
+                required: false
+                default: integration
+            upstream_branch:
+                description: Branch to fetch from the upstream repository
+                required: false
+                default: main
+
+concurrency:
+    group: upstream-sync-${{ github.repository }}
+    cancel-in-progress: false
+
+permissions:
+    contents: write
+    issues: write
+    pull-requests: write
+
+env:
+    UPSTREAM_REPOSITORY: ultraworkers/claw-code-parity
+    DEFAULT_TARGET_BRANCH: integration
+    DEFAULT_UPSTREAM_BRANCH: main
+
+jobs:
+    sync-upstream:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Resolve sync configuration
+              id: config
+              env:
+                  INPUT_TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
+                  INPUT_UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch }}
+                  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+              run: |
+                  set -euo pipefail
+
+                  target_branch="${INPUT_TARGET_BRANCH:-$DEFAULT_TARGET_BRANCH}"
+                  upstream_branch="${INPUT_UPSTREAM_BRANCH:-$DEFAULT_UPSTREAM_BRANCH}"
+                  target_branch="${target_branch:-$DEFAULT_TARGET_BRANCH}"
+                  upstream_branch="${upstream_branch:-$DEFAULT_UPSTREAM_BRANCH}"
+                  safe_target_branch="$(printf '%s' "$target_branch" | tr '/' '-')"
+                  sync_branch="sync/upstream-${upstream_branch}-into-${safe_target_branch}"
+
+                  {
+                    echo "default_branch=$DEFAULT_BRANCH"
+                    echo "target_branch=$target_branch"
+                    echo "upstream_branch=$upstream_branch"
+                    echo "sync_branch=$sync_branch"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Configure git identity
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            - name: Fetch origin and upstream
+              run: |
+                  set -euo pipefail
+
+                  git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git" 2>/dev/null \
+                    || git remote set-url upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+
+                  git fetch --no-tags origin "+refs/heads/*:refs/remotes/origin/*"
+                  git fetch --no-tags upstream "${{ steps.config.outputs.upstream_branch }}"
+
+            - name: Ensure target branch exists on the fork
+              id: target
+              env:
+                  TARGET_BRANCH: ${{ steps.config.outputs.target_branch }}
+                  DEFAULT_BRANCH: ${{ steps.config.outputs.default_branch }}
+              run: |
+                  set -euo pipefail
+
+                  if git show-ref --verify --quiet "refs/remotes/origin/${TARGET_BRANCH}"; then
+                    echo "created_target_branch=false" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+
+                  git checkout -B "$TARGET_BRANCH" "origin/$DEFAULT_BRANCH"
+                  git push origin "$TARGET_BRANCH"
+                  echo "created_target_branch=true" >> "$GITHUB_OUTPUT"
+
+            - name: Determine whether upstream changed
+              id: delta
+              env:
+                  TARGET_BRANCH: ${{ steps.config.outputs.target_branch }}
+                  UPSTREAM_BRANCH: ${{ steps.config.outputs.upstream_branch }}
+              run: |
+                  set -euo pipefail
+
+                  upstream_sha="$(git rev-parse "upstream/$UPSTREAM_BRANCH")"
+                  target_sha="$(git rev-parse "origin/$TARGET_BRANCH")"
+
+                  {
+                    echo "upstream_sha=$upstream_sha"
+                    echo "target_sha=$target_sha"
+                  } >> "$GITHUB_OUTPUT"
+
+                  if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" "origin/$TARGET_BRANCH"; then
+                    echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "needs_sync=true" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Stop when target branch already contains upstream
+              if: steps.delta.outputs.needs_sync == 'false'
+              run: echo "${{ steps.config.outputs.target_branch }} already contains upstream/${{ steps.config.outputs.upstream_branch }}"
+
+            - name: Attempt merge on sync branch
+              if: steps.delta.outputs.needs_sync == 'true'
+              id: merge
+              env:
+                  TARGET_BRANCH: ${{ steps.config.outputs.target_branch }}
+                  SYNC_BRANCH: ${{ steps.config.outputs.sync_branch }}
+                  UPSTREAM_BRANCH: ${{ steps.config.outputs.upstream_branch }}
+              run: |
+                  set -euo pipefail
+
+                  git checkout -B "$SYNC_BRANCH" "origin/$TARGET_BRANCH"
+                  if git merge --no-ff --no-edit "upstream/$UPSTREAM_BRANCH"; then
+                    echo "merge_status=clean" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+
+                  raw_conflicts="$(git diff --name-only --diff-filter=U)"
+                  git merge --abort || true
+                  git checkout -B "$SYNC_BRANCH" "origin/$TARGET_BRANCH"
+
+                  formatted_conflicts=""
+                  if [[ -n "$raw_conflicts" ]]; then
+                    while IFS= read -r file; do
+                      [[ -n "$file" ]] || continue
+                      formatted_conflicts+="- \`$file\`"$'\n'
+                    done <<< "$raw_conflicts"
+                  else
+                    formatted_conflicts="- <unknown conflict set>"
+                  fi
+
+                  {
+                    echo "merge_status=conflict"
+                    echo "conflict_files<<EOF"
+                    printf '%s' "$formatted_conflicts"
+                    echo
+                    echo "EOF"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Push sync branch
+              if: steps.merge.outputs.merge_status == 'clean'
+              env:
+                  SYNC_BRANCH: ${{ steps.config.outputs.sync_branch }}
+              run: git push --force-with-lease origin "$SYNC_BRANCH"
+
+            - name: Create or update clean sync PR
+              if: steps.merge.outputs.merge_status == 'clean'
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GH_REPO: ${{ github.repository }}
+                  TARGET_BRANCH: ${{ steps.config.outputs.target_branch }}
+                  SYNC_BRANCH: ${{ steps.config.outputs.sync_branch }}
+                  UPSTREAM_BRANCH: ${{ steps.config.outputs.upstream_branch }}
+                  UPSTREAM_SHA: ${{ steps.delta.outputs.upstream_sha }}
+                  TARGET_SHA: ${{ steps.delta.outputs.target_sha }}
+              run: |
+                  set -euo pipefail
+
+                  title="Sync upstream/${UPSTREAM_BRANCH} into ${TARGET_BRANCH}"
+                  body="$(cat <<EOF
+                  ## Automated upstream sync
+
+                  - Upstream repository: \`${UPSTREAM_REPOSITORY}\`
+                  - Upstream branch: \`${UPSTREAM_BRANCH}\`
+                  - Upstream SHA: \`${UPSTREAM_SHA}\`
+                  - Target branch: \`${TARGET_BRANCH}\`
+                  - Previous target SHA: \`${TARGET_SHA}\`
+
+                  This PR was created automatically because the merge from upstream applied cleanly.
+                  EOF
+                  )"
+
+                  pr_number="$(gh pr list \
+                    --head "$SYNC_BRANCH" \
+                    --base "$TARGET_BRANCH" \
+                    --state open \
+                    --json number \
+                    --jq '.[0].number // empty')"
+
+                  if [[ -n "$pr_number" ]]; then
+                    gh pr edit "$pr_number" --title "$title" --body "$body"
+                  else
+                    gh pr create --base "$TARGET_BRANCH" --head "$SYNC_BRANCH" --title "$title" --body "$body"
+                  fi
+
+            - name: Create or update conflict issue
+              if: steps.merge.outputs.merge_status == 'conflict'
+              id: conflict_issue
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GH_REPO: ${{ github.repository }}
+                  TARGET_BRANCH: ${{ steps.config.outputs.target_branch }}
+                  UPSTREAM_BRANCH: ${{ steps.config.outputs.upstream_branch }}
+                  UPSTREAM_SHA: ${{ steps.delta.outputs.upstream_sha }}
+                  CONFLICT_FILES: ${{ steps.merge.outputs.conflict_files }}
+              run: |
+                  set -euo pipefail
+
+                  title="Resolve upstream sync conflicts into ${TARGET_BRANCH}"
+                  body="$(cat <<EOF
+                  ## Automated upstream sync hit conflicts
+
+                  - Upstream repository: \`${UPSTREAM_REPOSITORY}\`
+                  - Upstream branch: \`${UPSTREAM_BRANCH}\`
+                  - Upstream SHA: \`${UPSTREAM_SHA}\`
+                  - Target branch: \`${TARGET_BRANCH}\`
+
+                  ### Conflicting files
+                  ${CONFLICT_FILES}
+
+                  ### Requested resolution
+                  Merge the latest upstream changes into \`${TARGET_BRANCH}\`, preserve fork-specific customizations, and open a PR with the resolution.
+
+                  ### Notes
+                  - The attempted merge was aborted in automation; there is no conflicted branch to recover.
+                  - If \`COPILOT_ASSIGN_TOKEN\` is configured as a repository secret, this workflow will assign Copilot automatically.
+                  EOF
+                  )"
+
+                  issue_number="$(gh issue list --state open --limit 100 --json number,title \
+                    | jq -r --arg title "$title" 'map(select(.title == $title)) | .[0].number // empty')"
+
+                  if [[ -n "$issue_number" ]]; then
+                    gh issue edit "$issue_number" --title "$title" --body "$body"
+                  else
+                    issue_url="$(gh issue create --title "$title" --body "$body")"
+                    issue_number="${issue_url##*/}"
+                  fi
+
+                  echo "issue_number=$issue_number" >> "$GITHUB_OUTPUT"
+
+            - name: Assign Copilot to conflict issue
+              if: steps.conflict_issue.outputs.issue_number != ''
+              env:
+                  GH_TOKEN: ${{ secrets.COPILOT_ASSIGN_TOKEN }}
+                  GH_REPO: ${{ github.repository }}
+                  ISSUE_NUMBER: ${{ steps.conflict_issue.outputs.issue_number }}
+                  TARGET_BRANCH: ${{ steps.config.outputs.target_branch }}
+                  UPSTREAM_BRANCH: ${{ steps.config.outputs.upstream_branch }}
+                  UPSTREAM_SHA: ${{ steps.delta.outputs.upstream_sha }}
+              run: |
+                  set -euo pipefail
+
+                  if [[ -z "${GH_TOKEN:-}" ]]; then
+                    echo "COPILOT_ASSIGN_TOKEN not configured; leaving conflict issue unassigned."
+                    exit 0
+                  fi
+
+                  instructions="Resolve the upstream merge conflicts from ${UPSTREAM_REPOSITORY}@${UPSTREAM_SHA} into ${TARGET_BRANCH}. Preserve fork-specific customizations unless upstream clearly supersedes them, and open a PR with the resolution."
+
+                  payload="$(jq -nc \
+                    --arg target_repo "$GH_REPO" \
+                    --arg base_branch "$TARGET_BRANCH" \
+                    --arg custom_instructions "$instructions" \
+                    '{assignees:["copilot-swe-agent[bot]"],agent_assignment:{target_repo:$target_repo,base_branch:$base_branch,custom_instructions:$custom_instructions}}')"
+
+                  gh api \
+                    --method POST \
+                    -H "Accept: application/vnd.github+json" \
+                    -H "X-GitHub-Api-Version: 2022-11-28" \
+                    "/repos/${GH_REPO}/issues/${ISSUE_NUMBER}/assignees" \
+                    --input - <<< "$payload"
