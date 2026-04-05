@@ -71,6 +71,12 @@ cd "$WORK_DIR"
 # Create a uv-managed Python environment and install vLLM
 uv python install 3.11
 uv venv --python 3.11 .venv
+
+# Verify the environment exists where you expect it to
+ls -la
+test -f .venv/bin/activate && echo "venv ready: $PWD/.venv"
+
+# Activate it before installing packages or starting vLLM
 . .venv/bin/activate
 uv pip install vllm
 
@@ -127,6 +133,8 @@ PY
 If your chosen Qwen model needs custom Hugging Face code at load time, add `--trust-remote-code` to the `vllm serve` line above.
 
 If you reduce `--max-model-len`, keep it high enough for Claw's large system prompt and tool schema. Values like `1024` are usually too small; `8192` is a more realistic lower bound if `16384` is too ambitious for your GPU.
+
+If you ever lose track of the environment later, the activation script should be at `~/qwen-test/.venv/bin/activate` (or `$WORK_DIR/.venv/bin/activate` if you changed `WORK_DIR`).
 
 ## Mock parity harness
 
